@@ -702,3 +702,141 @@ No, la red ya existía en Docker. El bloque `data` solo la lee (de ahí sacamos 
 **4. ¿Qué ganan con `local.nombre` frente a escribir `"web-gN"` en cada lugar donde se necesita?**
 
 Que el nombre se arma en un solo sitio a partir de `var.grupo`. Si cambia el grupo o el formato del nombre, se toca una línea y se actualiza en todos lados, sin riesgo de que quede un `web-g1` olvidado o mal escrito en alguna parte. Además el mismo código sirve para cualquier grupo con solo cambiar el `tfvars`.
+
+---
+
+## Fase 6 · Módulos: la receta una sola vez
+
+### Evidencias
+
+Creamos `infra/modules/sitio_web/` con `versions.tf`, `variables.tf` (con la validación del puerto que antes estaba en la raíz), `main.tf` y `outputs.tf` (`url` y `nombre`). En la raíz quitamos `docker_image.nginx` y `docker_container.web` y llamamos el módulo tres veces: `tienda` (8081), `blog` (8082) y `docs` (8083). También limpiamos `local.nombre`, `local.html`, las variables `puerto` y `mensaje` (y `mensaje` del `tfvars`) y los outputs `url` y `contenedor`. Agregamos el output `urls` con las tres direcciones.
+
+Antes del `init`, el plan falla:
+
+```text
+$ terraform plan
+Error: Module not installed
+Error: Module not installed
+Error: Module not installed
+```
+
+```text
+$ terraform init
+Initializing modules...
+- tienda in modules\sitio_web
+- docs in modules\sitio_web
+- blog in modules\sitio_web
+- Reusing version 4.6.0 of kreuzwerker/docker from the dependency lock file
+- Using previously-installed kreuzwerker/docker v4.6.0
+Terraform has been successfully initialized!
+
+$ terraform validate
+Success! The configuration is valid.
+```
+
+```text
+$ terraform plan
+  # docker_container.web will be destroyed
+  # (because docker_container.web is not in configuration)
+  # docker_image.nginx will be destroyed
+  # (because docker_image.nginx is not in configuration)
+  # module.blog.docker_container.this will be created
+  # module.blog.docker_image.this will be created
+  # module.docs.docker_container.this will be created
+  # module.docs.docker_image.this will be created
+  # module.tienda.docker_container.this will be created
+  # module.tienda.docker_image.this will be created
+
+Plan: 6 to add, 0 to change, 2 to destroy.
+
+Changes to Outputs:
+  - contenedor = "web-g1" -> null
+  - url        = "http://localhost:8080" -> null
+  + urls       = [
+      + "http://localhost:8081",
+      + "http://localhost:8082",
+      + "http://localhost:8083",
+    ]
+```
+
+Revisor (Johan): «Se destruyen `web-g1` y su imagen porque ya no están en el código raíz (ahora todo sale del módulo y las direcciones de los recursos cambian). Se crean 3 imágenes y 3 contenedores, uno por cada llamada al módulo. La imagen tiene `keep_locally = true`, así que al destruirla no se borra de Docker. Aprobado: 6 a crear, 0 a cambiar, 2 a destruir».
+
+```text
+$ terraform apply
+module.blog.docker_image.this: Creating...
+module.docs.docker_image.this: Creating...
+module.tienda.docker_image.this: Creating...
+docker_container.web: Destroying... [id=63703c67755a...]
+docker_container.web: Destruction complete after 1s
+docker_image.nginx: Destroying... [id=sha256:a8b39bd9cf0f...nginx:1.28-alpine]
+docker_image.nginx: Destruction complete after 0s
+module.docs.docker_image.this: Creation complete after 1s
+module.tienda.docker_image.this: Creation complete after 1s
+module.blog.docker_image.this: Creation complete after 1s
+module.tienda.docker_container.this: Creating...
+module.docs.docker_container.this: Creating...
+module.blog.docker_container.this: Creating...
+module.docs.docker_container.this: Creation complete after 1s [id=ebb36a8d4a0a...]
+module.tienda.docker_container.this: Creation complete after 1s [id=f0b27202ed40...]
+module.blog.docker_container.this: Creation complete after 1s [id=ace0048d4616...]
+
+Apply complete! Resources: 6 added, 0 changed, 2 destroyed.
+
+Outputs:
+
+red_driver = "bridge"
+urls = [
+  "http://localhost:8081",
+  "http://localhost:8082",
+  "http://localhost:8083",
+]
+```
+
+```text
+$ for p in 8081 8082 8083; do echo "$p: $(curl -s localhost:$p | head -1)"; done
+8081: <h1>Tienda del grupo 1</h1>
+8082: <h1>Blog del grupo 1</h1>
+8083: <h1>Docs del grupo 1</h1>
+
+$ terraform output urls
+[
+  "http://localhost:8081",
+  "http://localhost:8082",
+  "http://localhost:8083",
+]
+```
+
+Capturas: [tienda](evidencias/fase6-tienda-8081.png), [blog](evidencias/fase6-blog-8082.png), [docs](evidencias/fase6-docs-8083.png)
+
+El reto opcional del `for_each` con bloques `moved` no lo hicimos aquí porque en la Fase 7 igual se pasa a un solo `module "sitio"` con `for_each`.
+
+### Respuestas
+
+**1. Anoten la línea `Plan:` del paso 8. ¿Qué se destruyó, qué se creó y por qué?**
+
+`Plan: 6 to add, 0 to change, 2 to destroy.` Se destruyeron `docker_container.web` (web-g1) y `docker_image.nginx` porque ya no están declarados en la raíz; para Terraform un recurso dentro de un módulo tiene otra dirección (`module.tienda.docker_container.this`), así que lo ve como algo distinto y no como un "movimiento". Se crearon 6 recursos: una imagen y un contenedor por cada uno de los tres usos del módulo (tienda, blog y docs).
+
+**2. ¿Qué error obtendrían si el módulo no tuviera `versions.tf`?**
+
+Lo probamos en una copia aparte y `terraform init` falla con:
+
+```text
+Error: Failed to query available provider packages
+
+Could not retrieve the list of available versions for provider
+hashicorp/docker: provider registry registry.terraform.io does not have a
+provider named registry.terraform.io/hashicorp/docker
+
+Did you intend to use kreuzwerker/docker? If so, you must specify that source
+address in each module which requires that provider.
+```
+
+Pasa porque cada módulo resuelve sus providers por su cuenta, y si no le decimos el origen asume `hashicorp/docker`, que no existe.
+
+**3. Si mañana hay que agregar una etiqueta a todos los sitios, ¿cuántos archivos tocan con módulo? ¿Cuántos bloques habrían tocado copiando y pegando?**
+
+Con el módulo tocamos un solo archivo (`modules/sitio_web/main.tf`, un bloque `labels` en el contenedor) y se aplica a los tres sitios. Copiando y pegando tendríamos que tocar tres bloques `docker_container` (uno por sitio), y con el riesgo de que alguno quede distinto o se nos olvide.
+
+**4. ¿Qué necesitaría otro grupo para usar su módulo sin copiar la carpeta?**
+
+Que publiquemos el módulo en un lugar accesible, por ejemplo nuestro repo de GitHub, y ellos lo referencien en el `source`, algo como `source = "git::https://github.com/<usuario>/iac-taller-g1.git//infra/modules/sitio_web?ref=v1.0"` (mejor con un tag para fijar la versión), o subirlo a un registry. Ellos solo tendrían que pasar las variables `nombre`, `puerto`, `mensaje` (e `imagen` si quieren otra) y tener Docker y el provider `kreuzwerker/docker`.

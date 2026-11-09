@@ -12,7 +12,7 @@ terraform {
 provider "docker" {}
 
 resource "docker_image" "nginx" {
-  name         = "nginx:1.27-alpine"
+  name         = "nginx:1.28-alpine"
   keep_locally = true
 }
 

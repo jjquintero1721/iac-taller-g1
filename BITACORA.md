@@ -840,3 +840,307 @@ Con el módulo tocamos un solo archivo (`modules/sitio_web/main.tf`, un bloque `
 **4. ¿Qué necesitaría otro grupo para usar su módulo sin copiar la carpeta?**
 
 Que publiquemos el módulo en un lugar accesible, por ejemplo nuestro repo de GitHub, y ellos lo referencien en el `source`, algo como `source = "git::https://github.com/<usuario>/iac-taller-g1.git//infra/modules/sitio_web?ref=v1.0"` (mejor con un tag para fijar la versión), o subirlo a un registry. Ellos solo tendrían que pasar las variables `nombre`, `puerto`, `mensaje` (e `imagen` si quieren otra) y tener Docker y el provider `kreuzwerker/docker`.
+
+---
+
+## Fase 7 · State remoto y varios ambientes
+
+La contraseña del backend no aparece en ningún archivo del repo. En esta bitácora la reemplazamos por `****`.
+
+### Evidencias
+
+**Parte A · State remoto con bloqueo**
+
+Backend (lo corrimos en una sola línea porque estábamos en Windows):
+
+```text
+$ docker run -d --name tf-state-g1 -e POSTGRES_USER=terraform -e POSTGRES_PASSWORD=**** -e POSTGRES_DB=terraform_backend -p 5433:5432 postgres:17-alpine
+3143e63916f1969c6111910fc903ffed219539468a79b2e1ef73965dee340edf
+
+$ docker exec tf-state-g1 pg_isready -U terraform
+/var/run/postgresql:5432 - accepting connections
+```
+
+Conexión solo en la terminal:
+
+```text
+$ export PG_CONN_STR="postgres://terraform:****@localhost:5433/terraform_backend?sslmode=disable"
+```
+
+Agregamos `backend "pg" {}` vacío dentro del bloque `terraform` de `main.tf` y migramos:
+
+```text
+$ terraform init -migrate-state
+Initializing the backend...
+Do you want to copy existing state to the new backend?
+  Pre-existing state was found while migrating the previous "local" backend to the
+  newly configured "pg" backend. No existing state was found in the newly
+  configured "pg" backend. Do you want to copy this state to the new "pg"
+  backend? Enter "yes" to copy and "no" to start with an empty state.
+
+  Enter a value: yes
+
+Successfully configured the backend "pg"! Terraform will automatically
+use this backend unless the backend configuration changes.
+...
+Terraform has been successfully initialized!
+
+$ terraform state list
+data.docker_network.bridge
+module.blog.docker_container.this
+module.blog.docker_image.this
+module.docs.docker_container.this
+module.docs.docker_image.this
+module.tienda.docker_container.this
+module.tienda.docker_image.this
+
+$ docker exec tf-state-g1 psql -U terraform -d terraform_backend -c "SELECT id, name FROM terraform_remote_state.states;"
+ id |  name
+----+---------
+  1 | default
+(1 row)
+```
+
+Prueba de bloqueo. En la terminal 1 corrimos `terraform apply` y lo dejamos esperando en el `Enter a value:`. La primera vez no sirvió porque no había cambios y el apply terminó solo sin preguntar nada, así que la repetimos con `terraform apply -var="imagen=nginx:1.27-alpine"` para que sí tuviera algo que confirmar (respondimos `no`, no se aplicó nada). Mientras tanto, en la terminal 2:
+
+```text
+$ terraform plan
+
+Error: Error acquiring the state lock
+
+Error message: Workspace is already locked: default
+Lock Info:
+  ID:        e4e66ddc-ff97-9fa7-5d75-5d5764e32daf
+  Path:
+  Operation: OperationTypePlan
+  Who:       PC\juanj@PC
+  Version:   1.17.0
+  Created:   2026-11-09 21:59:06.402187 +0000 UTC
+  Info:
+
+Terraform acquires a state lock to protect the state from being written
+by multiple users at the same time. Please resolve the issue above and try
+again. For most commands, you can disable locking with the "-lock=false"
+flag, but this is not recommended.
+```
+
+Terminal 1:
+
+```text
+Plan: 6 to add, 0 to change, 6 to destroy.
+  Enter a value: no
+
+Apply cancelled.
+```
+
+**Parte B · Un mismo código, tres ambientes**
+
+Destroy del workspace `default`:
+
+```text
+$ terraform destroy
+  # module.blog.docker_container.this will be destroyed
+  # module.blog.docker_image.this will be destroyed
+  # module.docs.docker_container.this will be destroyed
+  # module.docs.docker_image.this will be destroyed
+  # module.tienda.docker_container.this will be destroyed
+  # module.tienda.docker_image.this will be destroyed
+
+Plan: 0 to add, 0 to change, 6 to destroy.
+```
+
+Revisor (Juan Jose): «Estamos en `default`, se van los 3 sitios y sus imágenes (las imágenes quedan en Docker por el `keep_locally`). Aprobado: 0 a crear, 0 a cambiar, 6 a destruir».
+
+```text
+Destroy complete! Resources: 6 destroyed.
+
+$ docker ps --format '{{.Names}}'
+tf-state-g1
+```
+
+Cambios en el código:
+
+- `locals.tf`: los ambientes de la guía con el TODO 1 resuelto (`imagen` por ambiente: dev y staging con `nginx:1.28-alpine`, prod con `nginx:1.27-alpine`).
+- `main.tf`: un solo `module "sitio"` con `for_each = local.sitios` y `imagen = local.amb.imagen` (TODO 2).
+- `outputs.tf`: `urls` ahora es un map `nombre => url` recorriendo `module.sitio` (TODO 3).
+- `variables.tf`: quitamos la variable `imagen` porque con el TODO 2 ya nadie la usaba (la imagen ahora sale del ambiente). Fue lo único que hicimos por fuera de la guía, para no dejar una variable muerta.
+
+Plan antes de `init` y en `default`:
+
+```text
+$ terraform plan
+Error: Module not installed
+
+$ terraform init
+Initializing modules...
+- sitio in modules\sitio_web
+Terraform has been successfully initialized!
+
+$ terraform plan
+Error: Invalid index
+
+  on locals.tf line 10, in locals:
+  10:   amb = local.ambientes[local.entorno]
+    ├────────────────
+    │ local.ambientes is object with 3 attributes
+    │ local.entorno is "default"
+
+The given key does not identify an element in this collection value.
+```
+
+Despliegue por ambiente:
+
+```text
+$ terraform workspace new dev
+Created and switched to workspace "dev"!
+
+$ terraform apply
+  # module.sitio["tienda"].docker_container.this will be created
+  # module.sitio["tienda"].docker_image.this will be created
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+Revisor (Juan Jose): «Workspace `dev`, 1 sitio (tienda). Aprobado: 2 a crear, 0 a cambiar, 0 a destruir».
+
+```text
+Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+urls = {
+  "tienda-g1-dev" = "http://localhost:8101"
+}
+```
+
+```text
+$ terraform workspace new staging
+Created and switched to workspace "staging"!
+
+$ terraform apply
+  # module.sitio["blog"].docker_container.this will be created
+  # module.sitio["blog"].docker_image.this will be created
+  # module.sitio["docs"].docker_container.this will be created
+  # module.sitio["docs"].docker_image.this will be created
+  # module.sitio["tienda"].docker_container.this will be created
+  # module.sitio["tienda"].docker_image.this will be created
+Plan: 6 to add, 0 to change, 0 to destroy.
+```
+
+Revisor (Juan Jose): «Workspace `staging`, 3 sitios con nginx 1.28. Aprobado: 6 a crear, 0 a cambiar, 0 a destruir».
+
+```text
+Apply complete! Resources: 6 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+urls = {
+  "blog-g1-staging" = "http://localhost:8202"
+  "docs-g1-staging" = "http://localhost:8203"
+  "tienda-g1-staging" = "http://localhost:8201"
+}
+```
+
+```text
+$ terraform workspace new prod
+Created and switched to workspace "prod"!
+
+$ terraform apply
+  # module.sitio["blog"].docker_container.this will be created
+  # module.sitio["blog"].docker_image.this will be created
+  # module.sitio["docs"].docker_container.this will be created
+  # module.sitio["docs"].docker_image.this will be created
+  # module.sitio["tienda"].docker_container.this will be created
+  # module.sitio["tienda"].docker_image.this will be created
+Plan: 6 to add, 0 to change, 0 to destroy.
+```
+
+Revisor (Juan Jose): «Workspace `prod`, 3 sitios con nginx 1.27. Aprobado: 6 a crear, 0 a cambiar, 0 a destruir».
+
+```text
+Apply complete! Resources: 6 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+urls = {
+  "blog-g1-prod" = "http://localhost:8302"
+  "docs-g1-prod" = "http://localhost:8303"
+  "tienda-g1-prod" = "http://localhost:8301"
+}
+
+$ terraform workspace list
+  default
+  dev
+* prod
+  staging
+```
+
+Verificación:
+
+```text
+$ for p in 8101 8201 8202 8203 8301 8302 8303; do echo "$p: $(curl -s localhost:$p | head -1)"; done
+8101: <h1>Tienda - DEV - grupo 1</h1>
+8201: <h1>Tienda - STAGING - grupo 1</h1>
+8202: <h1>Blog - STAGING - grupo 1</h1>
+8203: <h1>Docs - STAGING - grupo 1</h1>
+8301: <h1>Tienda - PROD - grupo 1</h1>
+8302: <h1>Blog - PROD - grupo 1</h1>
+8303: <h1>Docs - PROD - grupo 1</h1>
+
+$ docker exec tf-state-g1 psql -U terraform -d terraform_backend -c "SELECT id, name FROM terraform_remote_state.states;"
+ id |  name
+----+---------
+  1 | default
+  4 | dev
+  6 | staging
+  8 | prod
+(4 rows)
+
+$ docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}'
+NAMES               IMAGE                PORTS
+tienda-g1-prod      65645c7bb6a0         0.0.0.0:8301->80/tcp
+blog-g1-prod        65645c7bb6a0         0.0.0.0:8302->80/tcp
+docs-g1-prod        65645c7bb6a0         0.0.0.0:8303->80/tcp
+tienda-g1-staging   a8b39bd9cf0f         0.0.0.0:8201->80/tcp
+blog-g1-staging     a8b39bd9cf0f         0.0.0.0:8202->80/tcp
+docs-g1-staging     a8b39bd9cf0f         0.0.0.0:8203->80/tcp
+tienda-g1-dev       a8b39bd9cf0f         0.0.0.0:8101->80/tcp
+tf-state-g1         postgres:17-alpine   0.0.0.0:5433->5432/tcp
+```
+
+El `65645c7bb6a0` es la 1.27 y el `a8b39bd9cf0f` es la 1.28 (los mismos ids que vimos en las fases 2 y 3).
+
+Capturas: [dev 8101](evidencias/fase7-tienda-dev-8101.png), [staging 8201](evidencias/fase7-tienda-staging-8201.png), [prod 8301](evidencias/fase7-tienda-prod-8301.png)
+
+La contraseña no está en el repo (`git grep` no encuentra nada y sale con código 1):
+
+```text
+$ git grep <contraseña-del-backend>
+$ echo $?
+1
+```
+
+### Respuestas
+
+**1. ¿Qué respondió la terminal 2 en la prueba de bloqueo? ¿Qué problema de trabajo en equipo evita?**
+
+`Error acquiring the state lock` con `Workspace is already locked: default`, y le muestra quién tiene el bloqueo, desde cuándo y con qué versión. Evita que dos personas trabajen al mismo tiempo sobre el mismo state: sin bloqueo podrían pisarse, crear recursos duplicados o dejar el state corrupto o desactualizado.
+
+**2. ¿Dónde quedó la contraseña del backend y por qué no debe estar en `main.tf`?**
+
+Solo en la variable de entorno `PG_CONN_STR` de la terminal donde trabajamos (y obvio dentro del contenedor de Postgres). Si estuviera en `main.tf` quedaría en el historial de Git para siempre, cualquiera con acceso al repo tendría acceso al state (que a su vez puede tener más secretos), y aunque luego se borre del archivo seguiría en los commits viejos. Además así cada persona o ambiente puede usar sus propias credenciales sin cambiar el código.
+
+**3. ¿Qué filas tiene ahora la tabla `states` y cómo se relacionan con los workspaces?**
+
+Tiene 4 filas: `default` (id 1), `dev` (4), `staging` (6) y `prod` (8). Hay una fila por workspace y cada fila guarda el state completo de ese ambiente. La columna `name` es el nombre del workspace, así que cuando hacemos `workspace select prod`, Terraform lee y escribe solo la fila `prod`. Los ids no son seguidos porque la secuencia de Postgres se va consumiendo en otras operaciones, pero eso no afecta.
+
+**4. ¿Qué error da `terraform plan` en el workspace `default` y por qué es útil que falle?**
+
+`Error: Invalid index`, porque `local.ambientes` no tiene ninguna llave `"default"`. Es útil porque nos obliga a escoger explícitamente un ambiente (dev, staging o prod) antes de desplegar; así nadie aplica por accidente en un ambiente que no existe o sin saber en cuál está.
+
+**5. ¿Por qué dev tiene un solo sitio y staging replica a prod? ¿Por qué prod usa otra versión de imagen?**
+
+Dev es para probar rápido y barato, con un sitio basta para ver si algo funciona. Staging es la réplica de producción, entonces debe tener lo mismo que prod (los tres sitios) para que lo que se pruebe ahí sea confiable antes de lanzar. Prod usa la 1.27 porque la 1.28 todavía se está probando en dev y staging; cuando staging la valide, se cambia la imagen de prod y se promueve.
+
+**6. Los tres ambientes comparten código y backend. ¿Qué riesgo tiene eso frente a usar carpetas separadas por ambiente?**
+
+Que es muy fácil equivocarse de workspace: nada en los archivos dice en qué ambiente estás, entonces un `apply` o `destroy` en el workspace equivocado le puede pegar a prod. También un cambio en el código compartido le llega a todos los ambientes la próxima vez que se apliquen, y como comparten backend y credenciales, el que tiene acceso a dev tiene acceso a prod (y si el backend se cae, se caen los tres). Con carpetas separadas cada ambiente puede tener su propio backend, permisos y versión del módulo, a cambio de repetir algo de código.

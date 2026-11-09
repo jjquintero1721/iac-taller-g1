@@ -420,3 +420,149 @@ Pasó de 4 a 9. Es un contador de versión del state: cada vez que Terraform esc
 **5. En un proyecto real con bases de datos, ¿qué riesgo habría si este archivo se subiera a Git?**
 
 El state guarda en texto plano todos los atributos de los recursos, y en una base de datos eso incluye usuario, contraseña, cadenas de conexión, IPs internas, etc. Si va a Git esos secretos quedan en el historial para siempre aunque luego se borre el archivo. Además, si cada uno trabaja con su copia del state desde Git, se desincronizan y Terraform podría intentar crear duplicados o borrar cosas que sí existen.
+
+---
+
+## Fase 4 · Drift: cuando la realidad se desvía
+
+En esta fase sí tocamos Docker a mano a propósito, porque la guía lo pide.
+
+### Evidencias
+
+**Experimento A · Apagar el servidor**
+
+```text
+$ docker stop web-g1
+web-g1
+
+$ terraform plan
+docker_image.nginx: Refreshing state... [id=sha256:a8b39bd9cf0f...nginx:1.28-alpine]
+docker_container.web: Refreshing state... [id=154c325ea4e4...]
+
+  # docker_container.web must be replaced
+-/+ resource "docker_container" "web" {
+      ~ must_run          = false -> true
+      - publish_all_ports = false -> null
+      + ports { # forces replacement
+          + external = 8080 # forces replacement
+          + internal = 80 # forces replacement
+          + ip       = "0.0.0.0" # forces replacement
+          + protocol = "tcp" # forces replacement
+        }
+    }
+
+Plan: 1 to add, 0 to change, 1 to destroy.
+```
+
+Revisor (Nicolas): «El contenedor detenido ya no reporta los puertos, por eso pide reemplazo. Aprobado: 1 a crear, 0 a cambiar, 1 a destruir».
+
+```text
+$ terraform apply
+docker_container.web: Destroying... [id=154c325ea4e4...]
+docker_container.web: Destruction complete after 0s
+docker_container.web: Creating...
+docker_container.web: Creation complete after 0s [id=f58b41ab74f7...]
+Apply complete! Resources: 1 added, 0 changed, 1 destroyed.
+
+$ curl -s localhost:8080 | grep title
+<title>Welcome to nginx!</title>
+```
+
+**Experimento B · Borrar el servidor**
+
+```text
+$ docker rm -f web-g1
+web-g1
+
+$ terraform plan -refresh-only
+Note: Objects have changed outside of Terraform
+
+Terraform detected the following changes made outside of Terraform since the
+last "terraform apply" which may have affected this plan:
+
+  # docker_container.web has been deleted
+  - resource "docker_container" "web" {
+    }
+
+This is a refresh-only plan, so Terraform will not take any actions to undo
+these.
+
+$ terraform plan
+  # docker_container.web will be created
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+La primera salida solo cuenta lo que pasó por fuera ("has been deleted") y no propone nada; la segunda ya propone volver al estado deseado creando el contenedor.
+
+Revisor (Nicolas): «Aprobado: 1 a crear, 0 a cambiar, 0 a destruir».
+
+```text
+$ terraform apply
+docker_container.web: Creating...
+docker_container.web: Creation complete after 1s [id=89d8a9378d31...]
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed.
+
+$ curl -s localhost:8080 | grep title
+<title>Welcome to nginx!</title>
+```
+
+**Experimento C · Cambiar el contenido por dentro**
+
+```text
+$ docker exec web-g1 sh -c "echo '<h1>Cambio manual</h1>' > /usr/share/nginx/html/index.html"
+$ curl -s localhost:8080
+<h1>Cambio manual</h1>
+
+$ terraform plan
+No changes. Your infrastructure matches the configuration.
+```
+
+Captura de la página con el cambio manual: [evidencias/fase4-cambio-manual.png](evidencias/fase4-cambio-manual.png)
+
+Terraform no ve nada. Lo corregimos reemplazando el contenedor completo:
+
+```text
+$ terraform apply -replace=docker_container.web
+  # docker_container.web will be replaced, as requested
+-/+ resource "docker_container" "web" {
+    ...
+Plan: 1 to add, 0 to change, 1 to destroy.
+```
+
+Revisor (Nicolas): «Reemplazo pedido por nosotros. Aprobado: 1 a crear, 0 a cambiar, 1 a destruir».
+
+```text
+docker_container.web: Destroying... [id=89d8a9378d31...]
+docker_container.web: Destruction complete after 1s
+docker_container.web: Creating...
+docker_container.web: Creation complete after 0s [id=0abb0b0d2545...]
+Apply complete! Resources: 1 added, 0 changed, 1 destroyed.
+
+$ curl -s localhost:8080 | grep title
+<title>Welcome to nginx!</title>
+
+$ terraform plan
+No changes. Your infrastructure matches the configuration.
+```
+
+**Tabla de drift**
+
+| Experimento | ¿El plan lo detectó? | ¿Qué propuso Terraform? | ¿Cómo quedó corregido? |
+|---|---|---|---|
+| A · Apagar | Sí. `must_run` pasó de `false` a `true` y los puertos ya no aparecían | Reemplazar el contenedor (`-/+`, 1 a crear y 1 a destruir) | Con `terraform apply` se recreó y la página volvió a responder |
+| B · Borrar | Sí. `-refresh-only` mostró `has been deleted` | Crear el contenedor de nuevo (1 a crear) | Con `terraform apply` se creó otra vez y la página volvió |
+| C · Cambiar por dentro | No. El plan dijo `No changes` | Nada | Lo forzamos con `terraform apply -replace=docker_container.web`, que creó un contenedor limpio con la página original |
+
+### Respuestas
+
+**1. ¿Por qué Terraform no detectó el experimento C? ¿Qué tipo de herramienta se encarga de ese nivel?**
+
+Porque Terraform solo compara los atributos del recurso que conoce el provider (imagen, nombre, puertos, si está corriendo...), no lo que hay dentro del sistema de archivos del contenedor. El contenedor seguía existiendo con la misma imagen y los mismos puertos, entonces para él todo estaba bien. Terraform es de aprovisionamiento ("que exista la máquina"); lo de adentro, archivos y software instalado, es trabajo de las herramientas de gestión de configuración como Ansible, Chef o Puppet.
+
+**2. ¿Por qué `-replace` es una corrección coherente con la infraestructura inmutable?**
+
+Porque en vez de meternos al contenedor a arreglar el `index.html` a mano (que sería tratarlo como mascota), lo botamos y creamos uno nuevo desde la imagen y el código. Así volvemos a un estado conocido y reproducible, sin cambios escondidos que nadie documentó.
+
+**3. En un equipo real, ¿cómo detectarían el drift sin esperar a que alguien ejecute `plan` por casualidad?**
+
+Programando un `terraform plan` automático, por ejemplo cada noche en el pipeline de CI/CD, con `-detailed-exitcode` (devuelve código 2 cuando hay diferencias) o con `plan -refresh-only`, y que si encuentra cambios mande una alerta al equipo (correo, Slack, un issue). También hay plataformas como Terraform Cloud que traen detección de drift. Y de paso, quitar permisos para que nadie pueda tocar la infraestructura a mano.

@@ -566,3 +566,139 @@ Porque en vez de meternos al contenedor a arreglar el `index.html` a mano (que s
 **3. En un equipo real, ¿cómo detectarían el drift sin esperar a que alguien ejecute `plan` por casualidad?**
 
 Programando un `terraform plan` automático, por ejemplo cada noche en el pipeline de CI/CD, con `-detailed-exitcode` (devuelve código 2 cuando hay diferencias) o con `plan -refresh-only`, y que si encuentra cambios mande una alerta al equipo (correo, Slack, un issue). También hay plataformas como Terraform Cloud que traen detección de drift. Y de paso, quitar permisos para que nadie pueda tocar la infraestructura a mano.
+
+---
+
+## Fase 5 · Las piezas que dan flexibilidad
+
+### Evidencias
+
+Separamos el código en `main.tf`, `variables.tf`, `locals.tf`, `data.tf`, `outputs.tf` y `terraform.tfvars`, y resolvimos los TODO:
+
+- TODO 1: variable `mensaje` (string, sin default) en `variables.tf`.
+- TODO 2: local `etiquetas` con `curso = "arquitectura-sw-2"` y `grupo = tostring(var.grupo)`.
+- TODO 3: bloque `dynamic "labels"` en el contenedor que recorre `local.etiquetas`.
+- TODO 4 y 5: outputs `contenedor` (`docker_container.web.name`) y `red_driver` (`data.docker_network.bridge.driver`).
+
+```text
+$ terraform validate
+Success! The configuration is valid.
+
+$ terraform plan
+data.docker_network.bridge: Reading...
+data.docker_network.bridge: Read complete after 0s [id=bed7a41e60b0...]
+
+  # docker_container.web must be replaced
+-/+ resource "docker_container" "web" {
+      + labels { # forces replacement
+          + label = "curso"
+          + value = "arquitectura-sw-2"
+        }
+      + labels { # forces replacement
+          + label = "grupo"
+          + value = "1"
+        }
+      + upload { # forces replacement
+          + content = <<-EOT
+                <h1>Hola desde el grupo 1</h1>
+                <p>Desplegado con Terraform por el grupo 1</p>
+            EOT
+          + file    = "/usr/share/nginx/html/index.html"
+        }
+        ...
+    }
+
+Plan: 1 to add, 0 to change, 1 to destroy.
+
+Changes to Outputs:
+  + contenedor = "web-g1"
+  + red_driver = "bridge"
+```
+
+Revisor (Brandon): «El contenedor se reemplaza porque ahora le metemos un archivo con `upload` y le ponemos etiquetas, y esas dos cosas Docker solo las acepta al crear el contenedor (`forces replacement`). La imagen no cambia porque ya era la 1.28. Aprobado: 1 a crear, 0 a cambiar, 1 a destruir».
+
+```text
+$ terraform apply
+docker_container.web: Destroying... [id=0abb0b0d2545...]
+docker_container.web: Destruction complete after 0s
+docker_container.web: Creating...
+docker_container.web: Creation complete after 1s [id=63703c67755a...]
+
+Apply complete! Resources: 1 added, 0 changed, 1 destroyed.
+
+Outputs:
+
+contenedor = "web-g1"
+red_driver = "bridge"
+url = "http://localhost:8080"
+
+$ curl -s localhost:8080
+<h1>Hola desde el grupo 1</h1>
+<p>Desplegado con Terraform por el grupo 1</p>
+
+$ docker inspect web-g1 --format '{{json .Config.Labels}}'
+{"curso":"arquitectura-sw-2","grupo":"1","maintainer":"NGINX Docker Maintainers <docker-maint@nginx.com>"}
+```
+
+Captura: [evidencias/fase5-mensaje-grupo.png](evidencias/fase5-mensaje-grupo.png)
+
+Consola:
+
+```text
+$ terraform console
+> local.nombre
+"web-g1"
+> upper(var.mensaje)
+"HOLA DESDE EL GRUPO 1"
+> format("web-g%02d", var.grupo)
+"web-g01"
+> local.etiquetas
+{
+  "curso" = "arquitectura-sw-2"
+  "grupo" = "1"
+}
+> data.docker_network.bridge.driver
+"bridge"
+> exit
+```
+
+Prueba de la validación (solo plan):
+
+```text
+$ terraform plan -var="puerto=9500"
+Error: Invalid value for variable
+
+  on variables.tf line 6:
+   6: variable "puerto" {
+    ├────────────────
+    │ var.puerto is 9500
+
+El puerto debe estar entre 8000 y 8999.
+
+This was checked by the validation rule at variables.tf:11,3-13.
+
+$ terraform plan -var="puerto=8085"
+          ~ external = 8080 -> 8085 # forces replacement
+Plan: 1 to add, 0 to change, 1 to destroy.
+  ~ url        = "http://localhost:8080" -> "http://localhost:8085"
+```
+
+Este último no lo aplicamos, solo era para ver que pasaba la validación.
+
+### Respuestas
+
+**1. `puerto` tiene un default, puede venir de `terraform.tfvars` y se pasó con `-var`. ¿Qué valor gana cuando hay varios?**
+
+Gana el `-var` de la línea de comandos. El orden de menor a mayor prioridad es: el `default` de la variable, después `terraform.tfvars`, después los `*.auto.tfvars`, y al final `-var` / `-var-file` (si hay varios, el último que se escriba). Se vio con `-var="puerto=8085"`: el plan quería cambiar de 8080 a 8085 aunque el default sea 8080.
+
+**2. ¿Qué hizo el bloque `validation` con el puerto 9500? ¿En qué se parece a la idea de Policy as Code?**
+
+Frenó el plan de una vez con nuestro mensaje ("El puerto debe estar entre 8000 y 8999") sin siquiera llegar a hablar con Docker. Se parece a Policy as Code porque es una regla escrita en código que se revisa sola antes de aplicar y bloquea una configuración que no está permitida, sin depender de que alguien se acuerde de revisarla.
+
+**3. ¿Terraform creó la red `bridge`? ¿Qué le pasará cuando el grupo ejecute `destroy`?**
+
+No, la red ya existía en Docker. El bloque `data` solo la lee (de ahí sacamos el `driver`), no la crea ni la administra. Por eso con `destroy` no le pasa nada: Terraform solo destruye los recursos que él maneja (`resource`), no los data sources.
+
+**4. ¿Qué ganan con `local.nombre` frente a escribir `"web-gN"` en cada lugar donde se necesita?**
+
+Que el nombre se arma en un solo sitio a partir de `var.grupo`. Si cambia el grupo o el formato del nombre, se toca una línea y se actualiza en todos lados, sin riesgo de que quede un `web-g1` olvidado o mal escrito en alguna parte. Además el mismo código sirve para cualquier grupo con solo cambiar el `tfvars`.

@@ -1344,3 +1344,93 @@ Que el problema nunca llega a existir. Si el bucket público se crea en la nube,
 **5. ¿En qué paso del pipeline de la diapositiva va `validar.sh` y qué paso humano viene después?**
 
 En el paso 2, "Validar", que es justo correr fmt, validate, pruebas y políticas de forma automática después del commit. Después viene el paso 3, "Revisar", donde una persona lee el plan propuesto y lo aprueba (lo que hace nuestro revisor del plan), y solo ahí se pasa al paso 4, aplicar.
+
+---
+
+## Fase 9 · Auditoría cruzada y cierre
+
+### Evidencias
+
+**Parte A · Auditoría**
+
+Pendiente.
+
+**Parte B · Cierre**
+
+Hicimos el cierre antes de la auditoría porque la auditoría se hace sobre el repositorio (código, historial y bitácora) y no necesita la infraestructura arriba.
+
+```text
+$ terraform workspace select dev && terraform destroy
+  # module.sitio["tienda"].docker_container.this will be destroyed
+  # module.sitio["tienda"].docker_image.this will be destroyed
+Plan: 0 to add, 0 to change, 2 to destroy.
+```
+
+Revisor (Brandon): «Workspace `dev`, se va solo la tienda. Aprobado: 0 a crear, 0 a cambiar, 2 a destruir».
+
+```text
+Destroy complete! Resources: 2 destroyed.
+```
+
+```text
+$ terraform workspace select staging && terraform destroy
+  # module.sitio["blog"].docker_container.this will be destroyed
+  # module.sitio["blog"].docker_image.this will be destroyed
+  # module.sitio["docs"].docker_container.this will be destroyed
+  # module.sitio["docs"].docker_image.this will be destroyed
+  # module.sitio["tienda"].docker_container.this will be destroyed
+  # module.sitio["tienda"].docker_image.this will be destroyed
+Plan: 0 to add, 0 to change, 6 to destroy.
+```
+
+Revisor (Brandon): «Workspace `staging`, los tres sitios. Aprobado: 0 a crear, 0 a cambiar, 6 a destruir».
+
+```text
+Destroy complete! Resources: 6 destroyed.
+```
+
+```text
+$ terraform workspace select prod && terraform destroy
+  # module.sitio["blog"].docker_container.this will be destroyed
+  # module.sitio["blog"].docker_image.this will be destroyed
+  # module.sitio["docs"].docker_container.this will be destroyed
+  # module.sitio["docs"].docker_image.this will be destroyed
+  # module.sitio["tienda"].docker_container.this will be destroyed
+  # module.sitio["tienda"].docker_image.this will be destroyed
+Plan: 0 to add, 0 to change, 6 to destroy.
+```
+
+Revisor (Brandon): «Workspace `prod`, los tres sitios. Aprobado: 0 a crear, 0 a cambiar, 6 a destruir».
+
+```text
+Destroy complete! Resources: 6 destroyed.
+
+$ terraform workspace select default
+Switched to workspace "default".
+
+$ docker ps --format '{{.Names}}'
+tf-state-g1
+```
+
+Solo quedaba el backend, así que lo eliminamos:
+
+```text
+$ docker rm -f tf-state-g1
+tf-state-g1
+```
+
+Nota sobre las capturas: las primeras que tomamos quedaron muy recortadas, así que las repetimos con la ventana completa del navegador. Para eso volvimos a levantar cada fase con el código exacto de su commit (en una carpeta temporal y con state local), tomamos la captura y la destruimos enseguida. En la Fase 4 repetimos el mismo `docker exec` del experimento C para mostrar el cambio manual.
+
+### Respuestas
+
+**1. ¿Qué anti-patrón encontraron en el otro grupo? ¿Y cuál les señalaron a ustedes?**
+
+Pendiente (después de la auditoría).
+
+**2. ¿Qué habría pasado si eliminaban el contenedor del backend antes de ejecutar los `destroy`?**
+
+Se habría perdido el state de los tres ambientes, porque solo vivía en ese Postgres. Los 7 contenedores seguirían corriendo pero Terraform ya no sabría que existen: un `destroy` diría que no hay nada que destruir y un `apply` intentaría crearlos otra vez y chocaría con los nombres y puertos ocupados. Habría tocado borrarlos a mano con Docker, que es justo lo que queremos evitar, o importarlos uno por uno al state.
+
+**3. ¿Por qué `destroy` exige la misma disciplina de lectura que `apply`?**
+
+Porque también cambia la infraestructura real y no tiene vuelta atrás: lo que se borra (y los datos que tenga) no vuelve. Si no se lee el plan, uno puede estar en el workspace equivocado y tumbar prod creyendo que era dev, o borrar más recursos de los que pensaba. Por eso el revisor confirma en qué workspace estamos y cuántos recursos se van antes de aprobar.
